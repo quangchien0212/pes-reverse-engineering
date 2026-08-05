@@ -218,11 +218,16 @@ local DATA = {
     {"bp_collision_scale","f",1.0},{"bp_pass_base","f",101.5},{"bp_pass_fk","f",103.0},
     {"dribble_pregate","f",35.0},
     {"dribble_min_dist","f",2.5},{"const_15","f",15.0},{"dribble_cone_limit","f",90.0},
-    {"sec_engage_mul","f",20.0},{"sec_base_angle","f",35.0},
+    {"sec_engage_mul","f",20.0},{"sec_base_angle","f",35.0},{"sec_max_angle","f",45.0},
     {"bc_zero","f",0.0},{"bc_scale","f",0.007},{"bc_one","f",1.0},{"bc_floor","f",0.55},
     {"bc_abs_min","f",0.50},{"bc_cap_base","f",2.5},{"bc_cap_scale","f",0.013},
     {"st_half","f",0.5},{"st_pivot","f",40.0},{"st_span","f",60.0},
-    {"st_lo","f",23.0},{"st_hi","f",28.0},{"st_kmh","f",1000.0},
+    {"st_lo","f",23.0},{"st_hi","f",28.0},
+    -- Experimental only: the current hook controls a velocity ceiling, not
+    -- ball-to-player distance.  Keep this neutral until a displacement path
+    -- is traced; otherwise high Ball Control could allow a larger push.
+    {"st_bc_weight","f",0.0},{"st_bc_pivot","f",50.0},
+    {"st_kmh","f",1000.0},
     {"earlycross_normal","f",2.6125},{"earlycross_trait","f",0.3},
     {"gk_react_inv100","f",0.01},
     {"wall_inv100","f",0.01},{"wall_dur_base","f",0.215},{"wall_spd_scale","f",0.003},{"wall_spd_base","f",1.0},
@@ -233,6 +238,28 @@ local DATA = {
     {"ref_t1_outside","b",38},{"ref_t1_inside","b",35},{"ref_t2","b",70},{"ref_t3","b",105},
     {"ref_gate0_off","b",0},{"ref_gate1_off","b",0},{"ref_gate2_off","b",0},{"ref_gate3_off","b",0},
 }
+
+-- Selected safety ranges for user-supplied INI values.  These are validation
+-- guards, not gameplay clamps: an invalid value falls back to the Lua default
+-- instead of reaching an integer divide, a byte pack, or a NaN-producing path.
+local LIMITS = {
+    angle_gate_tier_div = {0.01, 100.0},
+    const_15            = {0.01, 1000.0},
+    sec_base_angle      = {0.0, 180.0},
+    sec_engage_mul      = {0.0, 180.0},
+    sec_max_angle       = {0.0, 180.0},
+    st_span             = {0.01, 200.0},
+    st_lo               = {0.0, 100.0},
+    st_hi               = {0.0, 100.0},
+    st_bc_weight        = {0.0, 0.5},
+    st_bc_pivot         = {40.0, 99.0},
+}
+
+local DATA_DEFAULTS = {}
+for _, d in ipairs(DATA) do DATA_DEFAULTS[d[1]] = d[3] end
+
+-- Forward declaration so the installer preflight can validate enabled caves.
+local CAVES
 
 -- popcount of the low 6 bits (teammate angular-bin filter). 64 bytes, fixed.
 local POPCOUNT =
@@ -319,6 +346,64 @@ local function load_ini(ctx)
         end
     end
     return t
+end
+
+local function read_data_value(ini, name, kind, default)
+    if ini[name] == nil then return default end
+    local v = tonumber(ini[name])
+    if v == nil or v ~= v or v == math.huge or v == -math.huge then
+        log(string.format("[aoba] invalid INI value %s=%s; using default %s", name, tostring(ini[name]), tostring(default)))
+        return default
+    end
+    local lim = LIMITS[name]
+    if lim and (v < lim[1] or v > lim[2]) then
+        log(string.format("[aoba] out-of-range INI value %s=%s; using default %s", name, tostring(v), tostring(default)))
+        return default
+    end
+    if kind == "b" and (v < 0 or v > 255 or v ~= math.floor(v)) then
+        log(string.format("[aoba] byte INI value %s=%s is not an integer in 0..255; using default %s", name, tostring(v), tostring(default)))
+        return default
+    end
+    return kind == "b" and math.floor(v) or v
+end
+
+local function preflight_layout(ver, on, OFF)
+    if #ver.rd ~= #REDIRECTS then
+        log(string.format("[aoba] redirect table mismatch: %d sites for %d entries; aborting", #ver.rd, #REDIRECTS))
+        return false
+    end
+    for i, r in ipairs(REDIRECTS) do
+        if on[r[1]] and (ver.rd[i] == nil or OFF[r[2]] == nil) then
+            log(string.format("[aoba] missing redirect metadata at index %d (%s/%s); aborting", i, r[1], r[2]))
+            return false
+        end
+    end
+    for _, c in ipairs(CAVES or {}) do
+        if on[c.f] and ver[c.h] == nil then
+            log(string.format("[aoba] missing hook address for %s/%s; aborting", c.f, c.h))
+            return false
+        end
+    end
+    return true
+end
+
+-- A byte patch is either still vanilla, already this patch's bytes, or an
+-- unexpected third state.  Rejecting the third state before writing prevents
+-- a partially applied feature when another module has changed one site.
+local function preflight_bytefixes(list, on)
+    local pending = {}
+    for _, fx in ipairs(list) do
+        if on[fx[1]] then
+            local current = memory.read(fx[2], #fx[3])
+            if current == fx[3] then
+                pending[#pending + 1] = fx
+            elseif memory.read(fx[2], #fx[4]) ~= fx[4] then
+                log(string.format("[aoba] unexpected bytes at %s for %s; aborting byte-fix set", hex(fx[2]), fx[1]))
+                return nil
+            end
+        end
+    end
+    return pending
 end
 
 -- emit helper: instructions, named labels for internal jumps, RIP to data,
@@ -493,6 +578,7 @@ local function build_secondary(ver, at, db, OFF)
     a:e("\xF3\x0F\x10\x85\x50\x01\x00\x00")             -- movss xmm0,[rbp+150h]  ; a5 urgency
     a:rip("\xF3\x0F\x59\x05", db + OFF.sec_engage_mul)  -- mulss xmm0,[20]
     a:rip("\xF3\x0F\x58\x05", db + OFF.sec_base_angle)  -- addss xmm0,[35]
+    a:rip("\xF3\x0F\x5D\x05", db + OFF.sec_max_angle)    -- minss xmm0,[45]      ; cap secondary allowance
     a:e("\x0F\x2F\xC2")                                 -- comiss xmm0,xmm2
     a:jcc32("\x0F\x87", ver.ret_sec_pass)               -- ja  -> skip cond1+2 -> cond3+4
     a:jmp(ver.ret_sec_fail)                             -- jmp -> pass branch
@@ -538,6 +624,14 @@ local function build_secondtouch(ver, at, db, OFF)
     a:e("\x03\x44\x24\x20")                                -- add eax,[rsp+20h]   ; Dribbling+Speed
     a:e("\xF3\x0F\x2A\xC0")                                -- cvtsi2ss xmm0,eax
     a:rip("\xF3\x0F\x59\x05", db + OFF.st_half)            -- mulss xmm0,[0.5]    ; (D+S)/2
+    a:e("\xF3\x0F\x11\x44\x24\x2C")                        -- movss [rsp+2Ch],xmm0 ; preserve base quality through the next call
+    a:e("\x4C\x89\xF1\xBA\x18\x00\x00\x00")                -- mov rcx,r14; mov edx,24 (Ball Control)
+    a:call(ver.LiveStatReader)
+    a:e("\xF3\x0F\x10\x44\x24\x2C")                        -- movss xmm0,[rsp+2Ch]
+    a:e("\xF3\x0F\x2A\xC8")                                -- cvtsi2ss xmm1,eax
+    a:rip("\xF3\x0F\x5C\x0D", db + OFF.st_bc_pivot)         -- subss xmm1,[Ball Control pivot]
+    a:rip("\xF3\x0F\x59\x0D", db + OFF.st_bc_weight)        -- mulss xmm1,[Ball Control weight]
+    a:e("\xF3\x0F\x58\xC1")                                -- addss xmm0,xmm1 ; Q=(D+S)/2 + w*(B-pivot)
     a:rip("\xF3\x0F\x5C\x05", db + OFF.st_pivot)           -- subss xmm0,[40]
     a:rip("\xF3\x0F\x5E\x05", db + OFF.st_span)            -- divss xmm0,[60]     ; norm
     a:rip("\xF3\x0F\x5F\x05", db + OFF.bc_zero)            -- maxss xmm0,[0]
@@ -728,7 +822,7 @@ local function build_refgates(ver, at, db, OFF)
     return a:build()
 end
 
-local CAVES = {
+CAVES = {
     { f="dribble",     b=build_angle,         h="hook_angle",         pad=3 },
     { f="dribble",     b=build_dribgate,      h="hook_dribgate",      pad=3 },
     { f="dribble",     b=build_stub_angle,    h="hook_stub_angle",    pad=2 },
@@ -772,16 +866,31 @@ function m.init(ctx)
     end
     OFF.popcount_lut = off
 
+    if not preflight_layout(ver, on, OFF) then return end
+    local fix_list = (vname == "1.07.02") and BYTEFIXES_107 or BYTEFIXES
+    local pending_fixes = preflight_bytefixes(fix_list, on)
+    if pending_fixes == nil then return end
+
     -- reuse the cave from a prior install across live-reloads (no leak); else alloc
     local reused = recover_block(ver, OFF, on)
     local block = reused or alloc_near(ver.hook_dribgate, 0x3000)
     if not block then log("[aoba] VirtualAlloc failed"); return end
     local db, code = block, block + 0x400
+    local block_end = block + 0x3000
 
-    -- data slots: defaults + ini overrides, then the fixed popcount LUT + reuse tag
+    -- data slots: validated defaults + INI overrides, then the fixed popcount LUT + reuse tag
+    local values = {}
+    for _, d in ipairs(DATA) do
+        values[d[1]] = read_data_value(ini, d[1], d[2], d[3])
+    end
+    if values.st_hi < values.st_lo then
+        log(string.format("[aoba] st_hi %.3f is below st_lo %.3f; restoring second-touch defaults", values.st_hi, values.st_lo))
+        values.st_lo = DATA_DEFAULTS.st_lo
+        values.st_hi = DATA_DEFAULTS.st_hi
+    end
     off = 0
     for _, d in ipairs(DATA) do
-        local v = ini[d[1]] and tonumber(ini[d[1]]) or d[3]
+        local v = values[d[1]]
         if d[2] == "b" then memory.write(db + off, memory.pack("u8", math.floor(v))); off = off + 1
         else memory.write(db + off, f32(v)); off = off + 4 end
     end
@@ -799,6 +908,10 @@ function m.init(ctx)
     for _, c in ipairs(CAVES) do
         if on[c.f] and ver[c.h] then
             local bytes = c.b(ver, cptr, db, OFF)
+            if cptr + #bytes > block_end then
+                log(string.format("[aoba] cave overflow at %s (%d bytes); aborting", c.h, #bytes))
+                return
+            end
             memory.write(cptr, bytes)
             local site = ver[c.h]
             memory.write(site, "\xE9" .. i32(cptr - (site + 5)) .. string.rep("\x90", c.pad))
@@ -815,6 +928,10 @@ function m.init(ctx)
         log("[aoba] GetFoulThresholds thunk already redirected - skipping referee")
     elseif on.referee then
         local bytes = build_foulthresh(ver, cptr, db, OFF)
+        if cptr + #bytes > block_end then
+            log(string.format("[aoba] cave overflow at referee (%d bytes); aborting", #bytes))
+            return
+        end
         memory.write(cptr, bytes)
         local thunk_num = ptr(thunk_addr)
         memory.write(thunk_addr, "\xE9" .. i32(cptr - (thunk_num + 5)))
@@ -832,14 +949,14 @@ function m.init(ctx)
         end
     end
 
-    -- byte patches (per-version sites; verify originals before writing)
-    for _, fx in ipairs(vname == "1.07.02" and BYTEFIXES_107 or BYTEFIXES) do
-        if on[fx[1]] then
-            if memory.read(fx[2], #fx[3]) == fx[3] then
-                memory.write(fx[2], fx[4])
-                log(string.format("[aoba] patch %-13s %s", fx[1], hex(fx[2])))
-            else log(string.format("[aoba] skip fix @%s (verify)", hex(fx[2]))) end
+    -- byte patches (per-version sites; the complete set was preflighted above)
+    for _, fx in ipairs(pending_fixes) do
+        memory.write(fx[2], fx[4])
+        if memory.read(fx[2], #fx[4]) ~= fx[4] then
+            log(string.format("[aoba] verify failed after patch @%s; aborting", hex(fx[2])))
+            return
         end
+        log(string.format("[aoba] patch %-13s %s", fx[1], hex(fx[2])))
     end
 
     -- summary: features toggled off, then the cave footprint
